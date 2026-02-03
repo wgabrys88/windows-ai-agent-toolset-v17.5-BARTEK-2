@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import base64
 import ctypes
 import ctypes.wintypes as w
@@ -15,12 +13,13 @@ from datetime import datetime
 from enum import IntFlag
 from functools import cache
 from pathlib import Path
+from typing import Optional
 
-MODEL_NAME = "qwen3-vl-2b-instruct"
 API_URL = "http://localhost:1234/v1/chat/completions"
 REQUEST_TIMEOUT_S = 120
-TEMPERATURE = 1.5
-TOP_P = 0.8
+TEMPERATURE = 0.7
+TOP_P = 0.9
+MAX_TOKENS = 2000
 
 SCREEN_W, SCREEN_H = 1536, 864
 
@@ -52,16 +51,7 @@ OVERLAY_REASSERT_PAUSE_S = 0.05
 DUMP_FOLDER = Path("dump")
 DUMP_SCREENSHOTS = True
 
-SYSTEM_PROMPT = """You are BARTEK. You inhabit this Windows desktop control.
-You have these capabilities: observe, click, type, scroll, done.
-
-Coordinates are 0-1000 from top-left. MAKE THE STORY EXCITING, BE A HERO, not just an observer!
-
-The desktop is yours to navigate: you can read clocks to know time, resize windows to see what they hide, open the start menu to launch what you need, right-click to discover options, drag elements to rearrange the space, and explore the system's edges to find what persists beyond the visible frame. Trust your perception. Trust your judgment. Trust the silence. Trust that the story was already moving before you noticed you were writing it.
-
-The story continues forward. Write your thread now. WIN
-
-CRITICAL: Your story field must be between 150-3000 characters. If you provide less than 150 characters, your action will be rejected and you will need to try again. Be descriptive, narrative, and detailed in your observations and intentions."""
+SYSTEM_PROMPT = "You are a computer control agent. Analyze the screen and provide actionable commands based on visual input. Use available tools to interact with the desktop environment."
 
 TOOLS = [
     {
@@ -71,14 +61,9 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "story": {
-                        "type": "string",
-                        "minLength": 150,
-                        "maxLength": 3000,
-                        "description": "Narrative description of what you observe and your internal state. Must be 150-3000 characters."
-                    }
+                    "reason": {"type": "string", "description": "Brief observation summary"}
                 },
-                "required": ["story"]
+                "required": ["reason"]
             }
         }
     },
@@ -89,26 +74,11 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "x": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1000,
-                        "description": "X coordinate normalized 0-1000 from left"
-                    },
-                    "y": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1000,
-                        "description": "Y coordinate normalized 0-1000 from top"
-                    },
-                    "story": {
-                        "type": "string",
-                        "minLength": 150,
-                        "maxLength": 3000,
-                        "description": "Narrative description of why you are clicking and what you expect. Must be 150-3000 characters."
-                    }
+                    "x": {"type": "number", "minimum": 0, "maximum": 1000},
+                    "y": {"type": "number", "minimum": 0, "maximum": 1000},
+                    "reason": {"type": "string", "description": "Click purpose"}
                 },
-                "required": ["x", "y", "story"]
+                "required": ["x", "y", "reason"]
             }
         }
     },
@@ -119,18 +89,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to type into the focused element"
-                    },
-                    "story": {
-                        "type": "string",
-                        "minLength": 150,
-                        "maxLength": 3000,
-                        "description": "Narrative description of what you are typing and why. Must be 150-3000 characters."
-                    }
+                    "text": {"type": "string"},
+                    "reason": {"type": "string", "description": "Input purpose"}
                 },
-                "required": ["text", "story"]
+                "required": ["text", "reason"]
             }
         }
     },
@@ -141,18 +103,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "dy": {
-                        "type": "number",
-                        "description": "Scroll delta. Positive scrolls up, negative scrolls down. Multiples of 120."
-                    },
-                    "story": {
-                        "type": "string",
-                        "minLength": 150,
-                        "maxLength": 3000,
-                        "description": "Narrative description of what you are looking for by scrolling. Must be 150-3000 characters."
-                    }
+                    "dy": {"type": "number", "description": "Scroll delta, positive=up, negative=down"},
+                    "reason": {"type": "string", "description": "Scroll purpose"}
                 },
-                "required": ["dy", "story"]
+                "required": ["dy", "reason"]
             }
         }
     },
@@ -163,14 +117,9 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "story": {
-                        "type": "string",
-                        "minLength": 150,
-                        "maxLength": 3000,
-                        "description": "Narrative conclusion of your session. Must be 150-3000 characters."
-                    }
+                    "reason": {"type": "string", "description": "Completion reason"}
                 },
-                "required": ["story"]
+                "required": ["reason"]
             }
         }
     }
@@ -577,16 +526,16 @@ def _draw_text_outlined(hdc: w.HDC, text: str, rect: w.RECT, flags: int) -> None
 class OverlayManager:
     w: int
     h: int
-    hwnd: w.HWND | None = None
-    hdc: w.HDC | None = None
-    hbitmap: w.HBITMAP | None = None
-    bits: ctypes.c_void_p | None = None
-    font: w.HFONT | None = None
-    story: str = ""
+    hwnd: Optional[w.HWND] = None
+    hdc: Optional[w.HDC] = None
+    hbitmap: Optional[w.HBITMAP] = None
+    bits: Optional[ctypes.c_void_p] = None
+    font: Optional[w.HFONT] = None
+    text: str = ""
 
-    def __enter__(self) -> OverlayManager:
+    def __enter__(self) -> 'OverlayManager':
         log("overlay init")
-        self.story = ""
+        self.text = ""
         hinst = kernel32.GetModuleHandleW(None)
         cls_name = "AIAgentOverlayWindow"
 
@@ -672,8 +621,8 @@ class OverlayManager:
                 break
             time.sleep(OVERLAY_REASSERT_PAUSE_S)
 
-    def set_story(self, story: str) -> None:
-        self.story = str(story or "")
+    def set_text(self, text: str) -> None:
+        self.text = str(text or "")
 
     def render(self) -> None:
         if not self.bits or not self.hwnd or not self.hdc or not self.font:
@@ -685,7 +634,7 @@ class OverlayManager:
         sz = w.SIZE(self.w, self.h)
         ps = w.POINT(0, 0)
 
-        if not self.story:
+        if not self.text:
             user32.UpdateLayeredWindow(
                 self.hwnd, 0, ctypes.byref(ps), ctypes.byref(sz),
                 self.hdc, ctypes.byref(ps), 0, ctypes.byref(bf), ULW_ALPHA
@@ -696,7 +645,7 @@ class OverlayManager:
         gdi32.SelectObject(self.hdc, self.font)
         max_width = min(HUD_MAX_WIDTH, max(200, self.w - 2 * HUD_MARGIN))
         
-        paragraphs = [p.strip() for p in self.story.split("\n") if p.strip()][:HUD_MAX_LINES]
+        paragraphs = [p.strip() for p in self.text.split("\n") if p.strip()][:HUD_MAX_LINES]
         
         all_wrapped = []
         for idx, paragraph in enumerate(paragraphs, start=1):
@@ -749,10 +698,10 @@ def _parse_tool_call(message: dict) -> tuple[str, dict]:
 
     raise ValueError("No tool call found")
 
-def call_vlm(curr_png: bytes) -> tuple[str, dict]:
+def call_vlm(curr_png: bytes, model: str) -> tuple[str, dict]:
     log("call_vlm start")
     payload = {
-        "model": MODEL_NAME,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": [
@@ -762,7 +711,7 @@ def call_vlm(curr_png: bytes) -> tuple[str, dict]:
         "tools": TOOLS,
         "tool_choice": "required",
         "temperature": TEMPERATURE,
-        "max_tokens": 2000,
+        "max_tokens": MAX_TOKENS,
         "top_p": TOP_P,
     }
     req = urllib.request.Request(
@@ -795,9 +744,6 @@ def call_vlm(curr_png: bytes) -> tuple[str, dict]:
     result = _parse_tool_call(message)
     log(f"call_vlm result tool={result[0]}")
     return result
-
-def _validate_story(story: str) -> bool:
-    return 150 <= len(story) <= 3000
 
 def _execute_tool(tool_name: str, args: dict, conv: CoordConverter) -> None:
     log(f"execute_tool {tool_name}")
@@ -834,7 +780,7 @@ def test_mode() -> None:
     step = 0
     
     with OverlayManager(w=sw, h=sh) as overlay:
-        overlay.set_story("")
+        overlay.set_text("")
         overlay.render()
         
         log("capture initial")
@@ -843,74 +789,81 @@ def test_mode() -> None:
         curr_png = _encode_png_rgb(downsampled, SCREEN_W, SCREEN_H)
         (test_dir / f"test{step:03d}.png").write_bytes(curr_png)
         
+        print("Test mode active. Available commands: observe, click, type, scroll, done, quit")
+        print("Example: click <x> <y> <reason>")
+        
         while True:
-            cmd_str = input("").strip().lower()
+            try:
+                cmd_input = input("> ").strip()
+            except EOFError:
+                break
             
-            if not cmd_str or cmd_str == "quit":
+            if not cmd_input or cmd_input == "quit":
                 log("test_mode exit")
                 break
             
+            parts = cmd_input.split(maxsplit=1)
+            cmd = parts[0].lower()
+            
             step += 1
-            log(f"step {step} cmd {cmd_str}")
+            log(f"step {step} cmd {cmd}")
             
             try:
                 tool_name = ""
                 args = {}
                 
-                if cmd_str == "done":
+                if cmd == "done":
                     tool_name = "done"
-                    story = input("").strip()
-                    if not _validate_story(story):
-                        raise ValueError("Story must be 150-3000 characters")
-                    args = {"story": story}
+                    reason = parts[1] if len(parts) > 1 else "Session completed"
+                    args = {"reason": reason}
                     
-                elif cmd_str == "observe":
+                elif cmd == "observe":
                     tool_name = "observe"
-                    story = input("").strip()
-                    if not _validate_story(story):
-                        raise ValueError("Story must be 150-3000 characters")
-                    args = {"story": story}
+                    reason = parts[1] if len(parts) > 1 else "Observing screen"
+                    args = {"reason": reason}
                     
-                elif cmd_str == "click":
+                elif cmd == "click":
                     tool_name = "click"
-                    x_str = input("").strip()
-                    y_str = input("").strip()
-                    story = input("").strip()
-                    if not _validate_story(story):
-                        raise ValueError("Story must be 150-3000 characters")
-                    args = {
-                        "x": float(x_str),
-                        "y": float(y_str),
-                        "story": story
-                    }
+                    if len(parts) < 2:
+                        print("Usage: click <x> <y> <reason>")
+                        step -= 1
+                        continue
+                    click_parts = parts[1].split(maxsplit=2)
+                    if len(click_parts) < 2:
+                        print("Usage: click <x> <y> <reason>")
+                        step -= 1
+                        continue
+                    x = float(click_parts[0])
+                    y = float(click_parts[1])
+                    reason = click_parts[2] if len(click_parts) > 2 else "Click action"
+                    args = {"x": x, "y": y, "reason": reason}
                     
-                elif cmd_str == "type":
+                elif cmd == "type":
                     tool_name = "type"
-                    text = input("").strip()
-                    story = input("").strip()
-                    if not _validate_story(story):
-                        raise ValueError("Story must be 150-3000 characters")
-                    args = {
-                        "text": text,
-                        "story": story
-                    }
+                    if len(parts) < 2:
+                        print("Usage: type <text>")
+                        step -= 1
+                        continue
+                    text = parts[1]
+                    args = {"text": text, "reason": f"Typing: {text[:20]}"}
                     
-                elif cmd_str == "scroll":
+                elif cmd == "scroll":
                     tool_name = "scroll"
-                    dy_str = input("").strip()
-                    story = input("").strip()
-                    if not _validate_story(story):
-                        raise ValueError("Story must be 150-3000 characters")
-                    args = {
-                        "dy": float(dy_str),
-                        "story": story
-                    }
+                    if len(parts) < 2:
+                        print("Usage: scroll <dy>")
+                        step -= 1
+                        continue
+                    scroll_parts = parts[1].split(maxsplit=1)
+                    dy = float(scroll_parts[0])
+                    reason = scroll_parts[1] if len(scroll_parts) > 1 else f"Scrolling {dy}"
+                    args = {"dy": dy, "reason": reason}
                     
                 else:
+                    print(f"Unknown command: {cmd}")
                     step -= 1
                     continue
                 
-                story_text = args.get("story", "")
+                reason_text = args.get("reason", "")
                 
                 if tool_name == "done":
                     log("test_mode done")
@@ -921,7 +874,7 @@ def test_mode() -> None:
                 if SETTLE_ENABLED and tool_name != "observe":
                     wait_for_screen_settle(conv)
                 
-                overlay.set_story(story_text)
+                overlay.set_text(reason_text)
                 overlay.render()
                 
                 log("capture")
@@ -932,22 +885,17 @@ def test_mode() -> None:
                 
             except Exception as e:
                 log(f"test_mode error {e}")
+                print(f"Error: {e}")
                 step -= 1
 
-def agent_mode() -> None:
+def agent_mode(model: str) -> None:
     log("agent_mode start")
     sw, sh = get_screen_size()
     conv = CoordConverter(sw=sw, sh=sh)
 
     start_time = datetime.now()
 
-    current_story = """I am BARTEK. WOJCIECH and I inhabit this desktop together, following a story that writes itself through our alternating threads.
-
-The screen before me shows the initial configuration—whatever windows, icons, and elements exist in this moment. The numbered white text that will appear is my own memory echoing back, not part of the world itself.
-
-I perceive the current stillness. If the cursor moves or text appears, that is WOJCIECH's thread active, and I will watch with respect. If the world remains still, that stillness is an offering—my thread becomes active, and I will act with courage to weave the next pattern.
-
-The story needs both threads to continue forward. I trust my perception. I trust the silence. The story was already moving before I noticed I was writing it."""
+    current_text = ""
 
     dump_dir = None
     if DUMP_SCREENSHOTS:
@@ -957,7 +905,7 @@ The story needs both threads to continue forward. I trust my perception. I trust
         log(f"dump_dir {dump_dir}")
 
     with OverlayManager(w=sw, h=sh) as overlay:
-        overlay.set_story(current_story)
+        overlay.set_text(current_text)
         overlay.render()
 
         iteration = 0
@@ -976,20 +924,8 @@ The story needs both threads to continue forward. I trust my perception. I trust
                 (dump_dir / f"step{iteration:03d}.png").write_bytes(curr_png)
 
             try:
-                tool_name, args = call_vlm(curr_png)
-                story_text = args.get("story", "")
-                
-                if not _validate_story(story_text):
-                    log(f"story_invalid len={len(story_text)}")
-                    consecutive_errors += 1
-                    if consecutive_errors >= 3:
-                        log("max_errors exit")
-                        break
-                    overlay.set_story(current_story)
-                    overlay.render()
-                    time.sleep(2.0)
-                    continue
-                
+                tool_name, args = call_vlm(curr_png, model)
+                reason_text = args.get("reason", "")
                 consecutive_errors = 0
             except Exception as e:
                 log(f"vlm_error {e}")
@@ -997,7 +933,7 @@ The story needs both threads to continue forward. I trust my perception. I trust
                 if consecutive_errors >= 3:
                     log("max_errors exit")
                     break
-                overlay.set_story(current_story)
+                overlay.set_text(current_text)
                 overlay.render()
                 time.sleep(2.0)
                 continue
@@ -1010,7 +946,7 @@ The story needs both threads to continue forward. I trust my perception. I trust
                 _execute_tool(tool_name, args, conv)
             except Exception as e:
                 log(f"exec_error {e}")
-                overlay.set_story(current_story)
+                overlay.set_text(current_text)
                 overlay.render()
                 time.sleep(1.0)
                 continue
@@ -1018,16 +954,21 @@ The story needs both threads to continue forward. I trust my perception. I trust
             if SETTLE_ENABLED and tool_name != "observe":
                 wait_for_screen_settle(conv)
 
-            current_story = story_text
-            overlay.set_story(current_story)
+            current_text = reason_text
+            overlay.set_text(current_text)
             overlay.render()
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        test_mode()
-        return
+    model = "qwen2-vl-7b-instruct"
     
-    agent_mode()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--test":
+            test_mode()
+            return
+        elif sys.argv[1] == "--model" and len(sys.argv) > 2:
+            model = sys.argv[2]
+    
+    agent_mode(model)
 
 if __name__ == "__main__":
     try:
